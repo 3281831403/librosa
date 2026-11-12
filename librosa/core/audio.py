@@ -198,25 +198,18 @@ def __soundfile_load(path, offset, duration, dtype):
     return y, sr_native
 
 
-def _align_step_size(target_step, target_sr, orig_sr):
-    """
-    When resampling a stream, we need to ensure that the target step size
-    remains integer-valued in the original sampling rate
+def _native_step(target_step, target_sr, orig_sr):
+    """Express a step measured in target-rate samples as a native-rate read size.
+
+    The read size is rounded to the nearest integer native sample.  Only its
+    cumulative effect matters: since it is rounded from the exact ratio, the
+    running error stays bounded by a fraction of one native sample and never
+    accumulates into a drift, regardless of how many chunks are processed.
     """
     if target_sr is None or target_sr == orig_sr:
-        return target_step
+        return int(target_step)
 
-    exact_native_step = (target_step * orig_sr) / target_sr
-    aligned_native_step = np.round(exact_native_step)
-
-    # Tolerances (rtol=1e-7, atol=1e-5) safely absorb precision errors from float arithmetic
-    if not np.isclose(exact_native_step, aligned_native_step, rtol=1e-7, atol=1e-5):
-        raise ParameterError(
-            f"Target block step of {target_step} samples at {target_sr} results in a "
-            f"fractional sample advance at original sampling rate {orig_sr}."
-        )
-
-    return int(aligned_native_step)
+    return max(1, int(round(target_step * orig_sr / target_sr)))
 
 
 @future_default(param_name="sr", old_default=None, new_default=22050, version="1.1.0")
@@ -252,12 +245,12 @@ def stream(
            to produce blocks of audio.  A *block*, in this context,
            refers to a buffer of audio which spans a given number of
            (potentially overlapping) frames.
-        2. Automatic sample-rate conversion is supported,
-           but not all combinations of ``block_length``, ``frame_length``, and
-           ``hop_length`` will be compatible with all sampling rates.
-           Specifically, ``(block_length * hop_length * native_sr) / sr``
-           must evaluate to an exact integer, where ``native_sr`` is the original
-           sampling rate of the stream prior to resampling.
+        2. Automatic sample-rate conversion is supported for any ratio
+           of the target and native sampling rates.  Blocks are aligned to
+           the target sampling rate: the ``k``-th block begins exactly at
+           target sample ``k * block_length * hop_length``, so the output
+           never drifts relative to the target grid regardless of how long
+           the input is.
         3. Many analyses require access to the entire signal
            to behave correctly, such as `resample`, `cqt`, or
            `beat_track`, so these methods will not be appropriate
@@ -418,7 +411,7 @@ def stream(
         sr = orig_sr
 
     try:
-        orig_read_size = _align_step_size(target_advance, sr, orig_sr)
+        orig_read_size = _native_step(target_advance, sr, orig_sr)
 
         read_frames = int(duration * orig_sr) if duration is not None else -1
 

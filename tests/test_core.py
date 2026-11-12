@@ -2785,13 +2785,17 @@ def test_stream_bad_res_type(path):
                             sr=16000, res_type="foo"))
 
 
-def test_stream_bad_hop(path):
-    # Fail if our hop length would not be integer-valued at the native
-    # sampling rate
-    with pytest.raises(librosa.ParameterError):
-        next(librosa.stream(path, block_length=3,
-                            frame_length=2048, hop_length=513,
-                            sr=16000))
+@pytest.mark.parametrize(
+    "sr", [16000, 8000, 11025, 32000, 96000, 5512.5]
+)
+def test_stream_arbitrary_resample_ratio(path, sr):
+    # Previously this configuration was rejected whenever the target block
+    # advance (block_length * hop_length) was not integer-valued at the
+    # native rate.  Any ratio is now supported, and the resulting blocks
+    # must still line up frame-for-frame with load(sr=...).
+    _verify_stream_parity(
+        path, sr=sr, block_length=3, frame_length=2048, hop_length=513
+    )
 
 
 def _verify_stream_parity(
@@ -2858,6 +2862,81 @@ def test_stream_geometry_and_types(path, block_length, frame_length, hop_length,
 @pytest.mark.parametrize("res_type", ["soxr_qq", "soxr_hq"])
 def test_stream_resampling(path, sr, res_type):
     _verify_stream_parity(path, sr=sr, res_type=res_type)
+
+
+@pytest.mark.parametrize("sr", [16000, 8000])
+@pytest.mark.parametrize("mono", [False, True])
+def test_stream_44100_multirate_parity(path, sr, mono):
+    # 44.1k -> 16k / 8k: target block steps do not divide evenly into a
+    # native-rate advance, but blocks must still align to the target grid
+    # exactly as load(sr=...) does.
+    block_length, frame_length, hop_length = 4, 1024, 512
+
+    if mono:
+        _verify_stream_parity(
+            path, sr=sr, block_length=block_length,
+            frame_length=frame_length, hop_length=hop_length
+        )
+        return
+
+    # For multi-channel audio, compare each channel independently against
+    # load(mono=False): the streaming path resamples per channel, matching
+    # load's channel-wise order rather than its mono downmix.
+    advance = block_length * hop_length
+    blocks = [
+        (k, y_block) for k, y_block in enumerate(
+            librosa.stream(
+                path, sr=sr, block_length=block_length,
+                frame_length=frame_length, hop_length=hop_length, mono=False
+            )
+        )
+    ]
+
+    # Computing the reference closes an open file handle, so it must happen
+    # after streaming has consumed the input.
+    if hasattr(path, "seek"):
+        path.seek(0)
+    y_full, _ = librosa.load(path, sr=sr, mono=False)
+
+    for k, y_block in blocks:
+        start = k * advance
+        if start >= y_full.shape[-1]:
+            break
+        stop = min(start + y_block.shape[-1], y_full.shape[-1])
+        assert np.allclose(
+            y_block[:, : stop - start], y_full[:, start:stop]
+        )
+
+
+@pytest.mark.parametrize("sr", [16000, 8000])
+def test_stream_resamples_incrementally(path, sr):
+    # Streaming must feed the resampler bounded chunks, never the whole file
+    # at once, and must not read ahead of the block grid.
+    read_sizes = []
+
+    real_resample_chunk = librosa.core.audio.soxr.ResampleStream.resample_chunk
+
+    def spy(self, x, last=False):
+        # The final flush (last=True) carries no new input, so exclude it
+        if not last:
+            read_sizes.append(x.shape[0])
+        return real_resample_chunk(self, x, last=last)
+
+    with mock.patch.object(
+        librosa.core.audio.soxr.ResampleStream, "resample_chunk", spy
+    ):
+        for _ in librosa.stream(
+            path, block_length=4, frame_length=1024, hop_length=512, sr=sr
+        ):
+            pass
+
+    # Each chunk must come from a single native block read sized to cover
+    # exactly one target block advance, not from the whole file.
+    expected_native_step = round(4 * 512 * 44100 / sr)
+    native_frames = soundfile.info(os.path.join("tests", "test_audio.ogg")).frames
+    assert read_sizes
+    assert all(0 < n <= expected_native_step for n in read_sizes)
+    assert max(read_sizes) < native_frames
 
 
 @pytest.mark.parametrize("offset", [0.0, 2.0, -2.0])
