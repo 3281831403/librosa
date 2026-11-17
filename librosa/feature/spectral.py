@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -17,7 +18,7 @@ from ..core.spectrum import _spectrogram, power_to_db
 from ..util.exceptions import ParameterError
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, Collection, Literal
+    from typing import Any, Callable, Collection, Iterable, Iterator, Literal
 
     from numpy.typing import DTypeLike
 
@@ -38,6 +39,7 @@ __all__ = [
     "chroma_vqt",
     "melspectrogram",
     "mfcc",
+    "mfcc_stream",
     "tonnetz",
 ]
 
@@ -2086,6 +2088,438 @@ def mfcc(
         return M
     else:
         raise ParameterError(f"MFCC lifter={lifter} must be a non-negative number")
+
+
+def _stream_frames(
+    blocks: Iterable[np.ndarray],
+    *,
+    n_fft: int,
+    hop_length: int,
+    center: bool,
+    pad_mode: _PadModeSTFT,
+) -> Iterator[np.ndarray]:
+    """Frame a stream of sample blocks exactly as `stft` frames the full signal.
+
+    This generator reproduces the framing of `stft` — including centered
+    padding at both ends of the signal — while holding only a bounded
+    number of samples in memory.  Frames are yielded in order, in chunks
+    of shape ``(..., n_fft, t)``, as soon as enough samples are available.
+
+    Parameters
+    ----------
+    blocks : iterable of np.ndarray [shape=(..., n)]
+        Sample blocks.  All blocks must share the same dtype and leading
+        (channel) shape; the trailing axis is time.  Block lengths may vary.
+    n_fft, hop_length, center, pad_mode
+        As in `stft`.
+
+    Yields
+    ------
+    frames : np.ndarray [shape=(..., n_fft, t)]
+        Contiguous chunks of frames, in frame order.
+    """
+    pad = n_fft // 2
+    carry = None
+    head = None
+    tail_samples = None
+    ndim = None
+    dtype = None
+    lead_shape: tuple[int, ...] | None = None
+    n_total = 0
+    # Head padding is only needed for centered framing
+    head_done = not (center and pad > 0)
+    # Tail padding values are only data-dependent for non-constant pad modes
+    track_tail = center and pad > 0 and pad_mode != "constant"
+
+    for block in blocks:
+        block = np.asarray(block)
+
+        if ndim is None:
+            ndim = block.ndim
+            dtype = block.dtype
+            lead_shape = block.shape[:-1]
+            if ndim < 1:
+                raise ParameterError("blocks must be at least 1-dimensional")
+            if not np.issubdtype(dtype, np.floating):
+                raise ParameterError(
+                    f"block dtype={dtype} must be a floating-point type"
+                )
+        else:
+            if block.ndim != ndim or block.shape[:-1] != lead_shape:
+                raise ParameterError(
+                    "all blocks must have the same leading (channel) shape"
+                )
+            if block.dtype != dtype:
+                raise ParameterError("all blocks must have the same dtype")
+
+        if block.shape[-1] == 0:
+            continue
+
+        if not np.all(np.isfinite(block)):
+            raise ParameterError("blocks must be finite everywhere")
+
+        n_total += block.shape[-1]
+
+        if track_tail:
+            # Keep the last pad+1 samples so that the tail padding can be
+            # computed once the stream is exhausted
+            if tail_samples is None:
+                tail_samples = block[..., -(pad + 1) :]
+            else:
+                tail_samples = np.concatenate((tail_samples, block), axis=-1)[
+                    ..., -(pad + 1) :
+                ]
+
+        if not head_done:
+            # Buffer the start of the signal until the head padding (which
+            # depends only on the first pad+1 samples) can be computed
+            head = block if head is None else np.concatenate((head, block), axis=-1)
+            if head.shape[-1] < pad + 1:
+                continue
+            padding = [(0, 0)] * (ndim - 1) + [(pad, 0)]
+            carry = np.pad(head, padding, mode=pad_mode)
+            head = None
+            head_done = True
+        else:
+            carry = (
+                block if carry is None else np.concatenate((carry, block), axis=-1)
+            )
+
+        if carry.shape[-1] >= n_fft:
+            frames = util.frame(carry, frame_length=n_fft, hop_length=hop_length)
+            carry = carry[..., frames.shape[-1] * hop_length :]
+            yield frames
+
+    # --- end of stream: flush the tail ---
+    if not head_done:
+        # The entire signal was shorter than the head-padding context, so
+        # pad what remains on both sides, exactly as stft does
+        if center and n_fft > n_total:
+            warnings.warn(
+                f"n_fft={n_fft} is too large for input signal of length={n_total}",
+                stacklevel=2,
+            )
+        if head is None:
+            # No samples were received at all
+            head = np.zeros(0, dtype=dtype if dtype is not None else np.float64)
+            ndim = 1
+        padding = [(0, 0)] * (ndim - 1) + [(pad, pad)]
+        carry = np.pad(head, padding, mode=pad_mode)
+        if carry.shape[-1] >= n_fft:
+            yield util.frame(carry, frame_length=n_fft, hop_length=hop_length)
+        return
+
+    if not center:
+        if n_total < n_fft:
+            raise ParameterError(
+                f"n_fft={n_fft} is too large for uncentered analysis of "
+                f"input signal of length={n_total}"
+            )
+    else:
+        if n_fft > n_total:
+            warnings.warn(
+                f"n_fft={n_fft} is too large for input signal of length={n_total}",
+                stacklevel=2,
+            )
+        if pad > 0:
+            if pad_mode == "constant":
+                tail_pad = np.zeros(lead_shape + (pad,), dtype=dtype)
+            else:
+                padding = [(0, 0)] * (ndim - 1) + [(0, pad)]
+                tail_pad = np.pad(tail_samples, padding, mode=pad_mode)[..., -pad:]
+            carry = (
+                tail_pad
+                if carry is None
+                else np.concatenate((carry, tail_pad), axis=-1)
+            )
+
+    if carry is not None and carry.shape[-1] >= n_fft:
+        yield util.frame(carry, frame_length=n_fft, hop_length=hop_length)
+
+
+def mfcc_stream(
+    source: Callable[[], Iterable[np.ndarray]],
+    *,
+    sr: float = 22050,
+    n_mfcc: int = 20,
+    dct_type: _DCTType = 2,
+    norm: _DCTNorm | None = "ortho",
+    lifter: float = 0,
+    mel_norm: Literal["slaney"] | float | None = "slaney",
+    ref: float | Callable = 1.0,
+    top_db: float | None = 80.0,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    window: _WindowSpec = "hann",
+    center: bool = True,
+    pad_mode: _PadModeSTFT = "constant",
+    power: float = 2.0,
+    **kwargs: Any,
+) -> np.ndarray:
+    """Mel-frequency cepstral coefficients (MFCCs) from a stream of audio blocks.
+
+    This computes the same features as `mfcc` acting on the full signal,
+    but consumes the input incrementally as a sequence of sample blocks.
+    The output is frame-for-frame identical to ``mfcc(y=...)`` evaluated on
+    the concatenated blocks, including centered zero-padding at both ends
+    of the signal and the global ``top_db`` threshold, while memory use
+    (beyond the returned feature array) stays bounded independently of the
+    signal length.
+
+    Parameters
+    ----------
+    source : callable () -> iterable of np.ndarray [shape=(..., n)]
+        A zero-argument callable returning a fresh iterator over sample
+        blocks.  Each block is one frame of the stream: shape ``(n,)`` for
+        mono or ``(channels, n)`` for multi-channel audio, matching the
+        layout of ``y`` in `mfcc`.  Block lengths may be arbitrary and may
+        vary between blocks, but the dtype and leading (channel) shape must
+        be consistent.
+
+        ``source`` is called once per analysis pass: twice by default (see
+        Notes), or once if ``top_db=None`` and ``ref`` is a scalar.  Each
+        call must produce the same sequence of samples.
+    sr : number > 0 [scalar]
+        sampling rate of the incoming signal
+    n_mfcc : int > 0 [scalar]
+        number of MFCCs to return
+    dct_type : {1, 2, 3}
+        Discrete cosine transform (DCT) type.
+        By default, DCT type-2 is used.
+    norm : None or 'ortho'
+        If ``dct_type`` is `2 or 3`, setting ``norm='ortho'`` uses an ortho-normal
+        DCT basis.
+        Normalization is not supported for ``dct_type=1``.
+    lifter : number >= 0
+        If ``lifter>0``, apply *liftering* (cepstral filtering) to the MFCCs::
+            M[n, :] <- M[n, :] * (1 + sin(pi * (n + 1) / lifter) * lifter / 2)
+
+        Setting ``lifter >= 2 * n_mfcc`` emphasizes the higher-order coefficients.
+        As ``lifter`` increases, the coefficient weighting becomes approximately linear.
+    mel_norm : float, 'slaney', or None
+        `norm` argument to `melspectrogram`
+    ref : float or callable
+        Reference value for the log conversion, as in `power_to_db`.
+        A scalar leaves each frame independent of the others.  Because the
+        signal is not held in memory, the only callable supported here is
+        `np.max`, which is evaluated over the frequency and time axes of
+        each leading channel exactly as in `mfcc`.
+    top_db : float or None
+        Threshold the mel spectrogram at ``top_db`` below its peak before
+        the log conversion, as in `power_to_db`.  The peak is computed over
+        the frequency and time axes, independently for each leading channel,
+        so a numeric value makes each frame's output depend on every other
+        frame in the same channel.  Pass ``None`` to disable the threshold
+        and make the result depend only on the frame itself.
+    n_fft : int > 0 [scalar]
+        length of the FFT frame
+    hop_length : int > 0 [scalar]
+        number of samples between successive frames.
+        See `librosa.stft`
+    win_length : int <= n_fft [scalar]
+        Each frame of audio is windowed by `window()`.
+        The window will be of length ``win_length`` and then padded
+        with zeros to match ``n_fft``.
+        If unspecified, defaults to ``win_length = n_fft``.
+    window : str, tuple, number, function, or np.ndarray [shape=(n_fft,)]
+        - a window specification (str, tuple, or number);
+          see `scipy.signal.get_window`
+        - a window function, such as `scipy.signal.windows.hann`
+        - a vector or array of length ``n_fft``
+
+        .. see also:: `librosa.filters.get_window`
+    center : bool
+        - If `True`, the signal is padded so that frame
+          ``t`` is centered at ``y[t * hop_length]``.
+        - If `False`, then frame ``t`` begins at ``y[t * hop_length]``
+    pad_mode : str
+        If ``center=True``, the padding mode to use at the edges of the signal.
+        By default, STFT uses zero padding.
+    power : float > 0 [scalar]
+        Exponent applied to the spectrum before calculating the melspectrogram,
+        e.g. 1 for magnitude, 2 for power **(default)**, etc.
+    **kwargs
+        additional keyword arguments for Mel filter bank parameters
+    n_mels : int > 0 [scalar]
+        number of Mel bands to generate
+    fmin : float >= 0 or str [scalar]
+        lowest frequency (in Hz) or note name (e.g., 'C1')
+    fmax : float >= 0 or str [scalar]
+        highest frequency (in Hz) or note name (e.g., 'C7').
+        If `None`, use ``fmax = sr / 2.0``
+    htk : bool [scalar]
+        use HTK formula instead of Slaney
+    dtype : np.dtype
+        The data type of the output basis.
+        By default, uses 32-bit (single-precision) floating point.
+
+    Returns
+    -------
+    M : np.ndarray [shape=(..., n_mfcc, t)]
+        MFCC sequence, identical (up to floating-point rounding) to
+        ``mfcc(y=...)`` on the concatenated blocks.
+
+    See Also
+    --------
+    mfcc
+    melspectrogram
+    librosa.stream
+
+    Notes
+    -----
+    The default ``top_db=80.0`` (and a callable ``ref``) makes every frame
+    depend on the peak of the entire log-mel spectrogram, which is unknown
+    until the stream ends.  To reproduce it exactly without buffering the
+    signal, ``source`` is consumed in two passes: the first tracks the
+    running per-channel peak, and the second computes the features.  With
+    ``top_db=None`` and a scalar ``ref``, frames are independent and a
+    single pass suffices.
+
+    Examples
+    --------
+    Stream MFCCs from 64K-sample blocks and compare to the full-signal result
+
+    >>> import numpy as np
+    >>> rng = np.random.default_rng(0)
+    >>> y = rng.standard_normal(5 * 22050).astype(np.float32)
+    >>> def source():
+    ...     for i in range(0, len(y), 65536):
+    ...         yield y[i:i + 65536]
+    >>> M_stream = librosa.feature.mfcc_stream(source, sr=22050)
+    >>> M_whole = librosa.feature.mfcc(y=y, sr=22050)
+    >>> M_stream.shape == M_whole.shape
+    True
+    >>> np.allclose(M_stream, M_whole, atol=2e-4)
+    True
+    """
+    import scipy.fft
+
+    if lifter < 0:
+        raise ParameterError(f"MFCC lifter={lifter} must be a non-negative number")
+
+    if win_length is None:
+        win_length = n_fft
+
+    if hop_length is None:
+        hop_length = int(win_length // 4)
+    elif not util.is_positive_int(hop_length):
+        raise ParameterError(f"hop_length={hop_length} must be a positive integer")
+
+    if center and pad_mode in ("wrap", "maximum", "mean", "median", "minimum"):
+        raise ParameterError(f"pad_mode='{pad_mode}' is not supported by mfcc_stream")
+
+    if callable(ref) and ref is not np.max:
+        raise ParameterError(
+            "mfcc_stream only supports a scalar ref or ref=np.max; other "
+            "callables require the entire signal to be held in memory"
+        )
+
+    if top_db is not None and top_db < 0:
+        raise ParameterError("top_db must be non-negative")
+
+    # Analysis window, constructed exactly as in stft
+    fft_window = filters.get_window(window, win_length, fftbins=True)
+    fft_window = util.pad_center(fft_window, size=n_fft)
+
+    # Mel filter bank, constructed exactly as in melspectrogram
+    mel_basis = filters.mel(sr=sr, n_fft=n_fft, norm=mel_norm, **kwargs)
+
+    def _mel_chunks() -> Iterator[np.ndarray]:
+        frames_in = _stream_frames(
+            source(),
+            n_fft=n_fft,
+            hop_length=hop_length,
+            center=center,
+            pad_mode=pad_mode,
+        )
+        for frames in frames_in:
+            # Broadcast the window over any leading (channel) axes
+            win = fft_window.reshape((1,) * (frames.ndim - 2) + (n_fft, 1))
+            # Round to the complex dtype stft would use for this input
+            S = scipy.fft.rfft(win * frames, axis=-2).astype(
+                util.dtype_r2c(frames.dtype)
+            )
+            mag = np.abs(S)
+            if power == 2:
+                np.square(mag, out=mag)
+            elif power != 1:
+                mag **= power
+            yield np.einsum("...ft,mf->...mt", mag, mel_basis, optimize=True)
+
+    # power_to_db defaults, reproduced below so that each frame can be
+    # converted as soon as its mel spectrum is available
+    amin = 1e-10
+
+    # First pass: track the per-channel peak of the mel spectrogram, but
+    # only if the output depends on it (top_db threshold or ref=np.max)
+    peak = None
+    n_frames_ref = None
+    if top_db is not None or callable(ref):
+        n_frames_ref = 0
+        for mel in _mel_chunks():
+            n_frames_ref += mel.shape[-1]
+            chunk_peak = mel.max(axis=(-2, -1))
+            peak = chunk_peak if peak is None else np.maximum(peak, chunk_peak)
+
+    if peak is not None:
+        # Shape the peak for broadcasting over frequency and time
+        peak = peak[(...,) + (None, None)]
+
+    if callable(ref):
+        ref_value = peak
+    else:
+        ref_value = np.abs(ref)
+
+    ref_db = 10.0 * np.log10(np.maximum(amin, ref_value))
+
+    if top_db is not None and peak is not None:
+        # The per-channel peak of the log spectrogram, computed with the
+        # same sequence of operations as power_to_db so that the threshold
+        # matches bit-for-bit
+        floor = 10.0 * np.log10(np.maximum(amin, peak))
+        floor = floor - ref_db
+        floor = floor - top_db
+    else:
+        floor = None
+
+    # Second pass (or the only pass, when no global context is needed)
+    chunks = []
+    n_frames_out = 0
+    for mel in _mel_chunks():
+        log_spec = np.maximum(amin, mel)
+        np.log10(log_spec, out=log_spec)
+        log_spec *= 10.0
+        log_spec -= ref_db
+        if floor is not None:
+            np.maximum(log_spec, floor, out=log_spec)
+
+        M = scipy.fft.dct(log_spec, axis=-2, type=dct_type, norm=norm)[
+            ..., :n_mfcc, :
+        ]
+        # Copy out of the (n_mels, t) DCT buffer so that retaining this
+        # chunk does not retain the full n_mels rows
+        M = M.copy()
+
+        if lifter > 0:
+            # shape lifter for broadcasting
+            LI = np.sin(np.pi * np.arange(1, 1 + n_mfcc, dtype=M.dtype) / lifter)
+            LI = util.expand_to(LI, ndim=M.ndim, axes=-2)
+            M *= 1 + (lifter / 2) * LI
+
+        n_frames_out += M.shape[-1]
+        chunks.append(M)
+
+    if n_frames_ref is not None and n_frames_out != n_frames_ref:
+        raise ParameterError(
+            "source did not produce the same samples on each pass"
+        )
+
+    if not chunks:
+        # No complete frames (only possible for empty input with odd n_fft)
+        return np.zeros((n_mfcc, 0), dtype=mel_basis.dtype)
+
+    return np.concatenate(chunks, axis=-1)
 
 
 def melspectrogram(

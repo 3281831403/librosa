@@ -11,6 +11,7 @@ from .spectral import chroma_stft as chroma_stft
 from .spectral import chroma_vqt as chroma_vqt
 from .spectral import melspectrogram as melspectrogram
 from .spectral import mfcc as mfcc
+from .spectral import mfcc_stream as mfcc_stream
 from .spectral import poly_features as poly_features
 from .spectral import rms as rms
 from .spectral import spectral_bandwidth as spectral_bandwidth

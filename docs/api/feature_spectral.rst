@@ -12,6 +12,7 @@ Spectral features
     tonnetz
     melspectrogram
     mfcc
+    mfcc_stream
     spectral_centroid
     spectral_bandwidth
     spectral_contrast

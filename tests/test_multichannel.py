@@ -682,6 +682,28 @@ def test_mfcc_multi_time(y_multi):
     assert np.allclose(C1, Call[1]), np.max(np.abs(C1 - Call[1]))
 
 
+@pytest.mark.parametrize("center", [True, False])
+@pytest.mark.parametrize("block_length", [1, 997, 65536])
+def test_mfcc_stream_multi(y_multi, center, block_length):
+    y, sr = y_multi
+
+    def source():
+        for i in range(0, y.shape[-1], block_length):
+            yield y[:, i : i + block_length]
+
+    Call = librosa.feature.mfcc(y=y, sr=sr, center=center)
+    Cstream = librosa.feature.mfcc_stream(source, sr=sr, center=center)
+
+    # Frame count must match exactly
+    assert Cstream.shape == Call.shape
+
+    # And each channel must match the whole-signal result
+    assert np.allclose(Cstream, Call, atol=2e-4), np.max(np.abs(Cstream - Call))
+
+    # Verify that they're not all the same
+    assert not np.allclose(Cstream[0], Cstream[1])
+
+
 def test_melspectrogram_multi(s_multi):
     S, sr = s_multi
 

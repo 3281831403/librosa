@@ -933,6 +933,165 @@ def test_mfcc_badlifter(lifter, rng):
     librosa.feature.mfcc(S=S, lifter=lifter)
 
 
+def _block_source(y, block_lengths):
+    """Build a re-iterable block source over ``y`` with the given block lengths."""
+
+    def source():
+        i = 0
+        k = 0
+        n = y.shape[-1]
+        while i < n:
+            step = block_lengths[k % len(block_lengths)]
+            yield y[..., i : i + step]
+            i += step
+            k += 1
+
+    return source
+
+
+@pytest.fixture(scope="module", params=[np.float32, np.float64])
+def y_stream(request):
+    rng = np.random.default_rng(0)
+    sr = 22050
+    t = np.arange(5 * sr) / sr
+    y = (
+        np.sin(2 * np.pi * 220 * t)
+        + 0.5 * np.sin(2 * np.pi * 517 * t)
+        + 0.01 * rng.standard_normal(len(t))
+    )
+    # Quiet head and tail so that the top_db threshold really binds
+    y[: sr // 2] *= 1e-3
+    y[-sr // 2 :] *= 1e-4
+    return y.astype(request.param), sr
+
+
+@pytest.mark.parametrize(
+    "block_lengths", [[65536], [1], [997], [512], [3, 65536, 1000, 7]]
+)
+@pytest.mark.parametrize("center", [True, False])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(),
+        dict(top_db=None),
+        dict(ref=np.max),
+        dict(ref=100.0),
+        dict(lifter=22, dct_type=3),
+        dict(n_mfcc=13, n_mels=40),
+        dict(n_fft=1024, hop_length=256),
+        dict(win_length=1024, window="hamming"),
+        dict(power=1.0),
+        dict(pad_mode="reflect"),
+    ],
+)
+def test_mfcc_stream_matches_mfcc(y_stream, center, block_lengths, kwargs):
+    y, sr = y_stream
+    whole = librosa.feature.mfcc(y=y, sr=sr, center=center, **kwargs)
+    stream = librosa.feature.mfcc_stream(
+        _block_source(y, block_lengths), sr=sr, center=center, **kwargs
+    )
+
+    # Frame count must match exactly
+    assert stream.shape == whole.shape
+    assert stream.dtype == whole.dtype
+
+    # Frame values must match to within float precision
+    atol = 2e-4 if y.dtype == np.float32 else 2e-6
+    assert np.allclose(stream, whole, atol=atol), np.max(np.abs(stream - whole))
+
+
+@pytest.mark.parametrize("center", [True, False])
+def test_mfcc_stream_multichannel(y_stream, center):
+    y, sr = y_stream
+    y2 = np.stack([y, np.roll(y, 977) * 0.7]).astype(y.dtype)
+    whole = librosa.feature.mfcc(y=y2, sr=sr, center=center)
+    stream = librosa.feature.mfcc_stream(
+        _block_source(y2, [65536]), sr=sr, center=center
+    )
+    assert stream.shape == whole.shape
+    atol = 2e-4 if y.dtype == np.float32 else 2e-6
+    assert np.allclose(stream, whole, atol=atol), np.max(np.abs(stream - whole))
+
+
+def test_mfcc_stream_single_pass(y_stream):
+    # With top_db=None and a scalar ref, the source must only be consumed once
+    y, sr = y_stream
+    calls = []
+
+    def source():
+        calls.append(1)
+        yield y
+
+    librosa.feature.mfcc_stream(source, sr=sr, top_db=None)
+    assert len(calls) == 1
+
+    # With the default top_db, a second pass is needed for the global peak
+    def source2():
+        calls.append(1)
+        yield y
+
+    librosa.feature.mfcc_stream(source2, sr=sr)
+    assert len(calls) == 3
+
+
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_mfcc_stream_badlifter(y_stream):
+    y, sr = y_stream
+    librosa.feature.mfcc_stream(_block_source(y, [4096]), sr=sr, lifter=-1)
+
+
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_mfcc_stream_badref(y_stream):
+    # Arbitrary callable refs cannot be evaluated in constant memory
+    y, sr = y_stream
+    librosa.feature.mfcc_stream(_block_source(y, [4096]), sr=sr, ref=np.median)
+
+
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_mfcc_stream_inconsistent_source(y_stream):
+    # A source that changes between passes must be detected
+    y, sr = y_stream
+    state = {"n": 0}
+
+    def source():
+        state["n"] += 1
+        yield y[: sr * (state["n"])]  # longer on each pass
+
+    librosa.feature.mfcc_stream(source, sr=sr)
+
+
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_mfcc_stream_nonfinite(y_stream):
+    y, sr = y_stream
+
+    def source():
+        block = y[:4096].copy()
+        block[0] = np.nan
+        yield block
+
+    librosa.feature.mfcc_stream(source, sr=sr)
+
+
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_mfcc_stream_ragged_channels(y_stream):
+    y, sr = y_stream
+
+    def source():
+        yield y[:4096]
+        yield np.stack([y[:4096], y[:4096]])
+
+    librosa.feature.mfcc_stream(source, sr=sr)
+
+
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_mfcc_stream_short_uncentered(y_stream):
+    # center=False with fewer samples than n_fft, mirroring stft
+    y, sr = y_stream
+    librosa.feature.mfcc_stream(
+        _block_source(y[:1024], [1024]), sr=sr, center=False
+    )
+
+
 # -- feature inversion tests
 @pytest.mark.parametrize("power", [1, 2])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
